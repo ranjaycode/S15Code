@@ -1,0 +1,93 @@
+# Capability tiers.
+#
+# A tier is a NAME plus the gateway request fields that name expands to. Nothing
+# in s15code knows any of these names, providers or models: add a tier, rename a
+# tier, or repoint one at a different provider entirely by editing this file.
+#
+# `order` is the ladder, cheapest first. `policy.py` walks it downwards when the
+# run is under budget pressure, so the order is the only thing that defines what
+# "downgrade" means.
+
+order: [economy, standard, frontier]
+default_tier: standard
+
+# The shipped ladder varies REASONING EFFORT and the output ceiling on one model,
+# which is the 2026 control primitive (Gemini thinking_level, OpenAI
+# reasoning_effort, Anthropic thinking budgets) and the spread is real: output
+# tokens are billed 6x input on this model, so capping max_tokens genuinely caps
+# spend. The projected cost across the three rungs is a 5x spread.
+#
+# To route ACROSS providers instead, replace the three `request` blocks with the
+# models your gateway actually serves (`GET /v1/capabilities` lists them) and
+# reorder `order` by the prices in pricing.yaml. Nothing in Python changes:
+#
+#   economy:  {provider: nvidia, model: deepseek-ai/deepseek-v4-pro}   # 0.14/0.28
+#   standard: {provider: gemini, model: gemini-3.1-flash-lite}         # 0.25/1.50
+#   frontier: {provider: groq,   model: openai/gpt-oss-120b}
+#
+# Verify each provider is configured before flipping: a tier pointing at a
+# provider with no key fails the call, it does not silently fall back.
+
+tiers:
+  economy:
+    # Every key under `request` is merged verbatim into the gateway's /v1/chat
+    # body. That is the whole tier -> provider mapping: no Python edit needed to
+    # change a provider, a model, a reasoning effort or a token ceiling.
+    request:
+      provider: gemini
+      model: gemini-3.1-flash-lite
+      reasoning: "off"
+      max_tokens: 512
+      temperature: 0
+    # Which row of pricing.yaml this tier is billed against. Defaults to the
+    # request model when omitted.
+    price_model: gemini-3.1-flash-lite
+    # What the estimator assumes before the call returns, in tokens. Real usage
+    # replaces this the moment the response lands.
+    projected_input_tokens: 1200
+    projected_output_tokens: 400
+
+  standard:
+    request:
+      provider: gemini
+      model: gemini-3.1-flash-lite
+      reasoning: low
+      max_tokens: 1024
+      temperature: 0
+    price_model: gemini-3.1-flash-lite
+    projected_input_tokens: 2500
+    projected_output_tokens: 800
+
+  frontier:
+    request:
+      provider: gemini
+      model: gemini-3.1-flash-lite
+      reasoning: high
+      max_tokens: 4096
+      temperature: 0
+    price_model: gemini-3.1-flash-lite
+    projected_input_tokens: 6000
+    projected_output_tokens: 2000
+
+# Which tier a graph ROLE asks for. Keys are the runtime's own skill/role names
+# (never task content), so a node "declares the tier it needs" by declaring its
+# role. `default` covers every role not listed.
+role_tiers:
+  default: standard
+  memory_recall: economy
+  remember_explicit_fact: economy
+  web_search: economy
+  fetch_url: economy
+  index_file: economy
+  list_directory: economy
+  read_file: economy
+  create_reminder: economy
+  researcher: economy
+  retriever: economy
+  summariser: economy
+  formatter: economy
+  distiller: standard
+  content: standard
+  coder_validator: standard
+  compose_surface: standard
+  answer_with_evidence: frontier
