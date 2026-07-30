@@ -44,10 +44,15 @@ S15Code/
 │   │   ├── budget.py        allowance, spend, reservations, allocation
 │   │   ├── policy.py        proceed / downgrade / branch / refuse
 │   │   └── controller.py    the hard controller at the call seam
-│   └── telemetry/         NEW — the same journal, as OTel spans
-│       └── spans.py         run → agent loop → plan → node → provider call
-├── config/                tiers.yaml · pricing.yaml · budgets.yaml
+│   ├── telemetry/         NEW — the same journal, as OTel spans
+│   │   └── spans.py         run → agent loop → plan → node → provider call
+│   └── evals/             NEW — did the answer RESOLVE the task?
+│       ├── config.py        the rubric, the bar and the judge panel, from YAML
+│       ├── judge.py         LLM-as-judge on a generic, task-agnostic rubric
+│       └── tasks.py         reads a task set; never contains one
+├── config/                tiers.yaml · pricing.yaml · budgets.yaml · evals.yaml
 ├── proofs/                the generic proof harness
+│   └── tasks/               task sets, as DATA a reviewer can replace
 └── tests/
 ```
 
@@ -115,11 +120,12 @@ the layer is additive.
 
 ## Proofs
 
-One harness, one code path, three proofs. Each takes the **task, budget and
-principal as arguments**, asserts real invariants, exits non-zero on failure, and
-writes JSON to `proofs/out/`.
+One harness, one code path, four proofs. Each takes the **task (or task set),
+budget and principal as arguments**, asserts real invariants, exits non-zero on
+failure, and writes JSON to `proofs/out/`.
 
 ```bash
+uv run python proofs/p1_cost_per_task.py   --tasks proofs/tasks/mixed.jsonl
 uv run python proofs/p2_budget_holds.py    --task "<any task>" --budget 0.02
 uv run python proofs/p3_denial_of_wallet.py --task "<any task>" --budget 0.002
 uv run python proofs/p4_trace_export.py     --task "<any task>" --budget 0.02
@@ -127,6 +133,7 @@ uv run python proofs/p4_trace_export.py     --task "<any task>" --budget 0.02
 
 | Proof | Proves |
 |---|---|
+| `p1_cost_per_task` | The same task set through always-frontier, always-cheapest-with-retries and the budget-aware cascade, on one ledger. Reports spend, calls, cost per call and **cost per resolved task** per strategy, with "resolved" decided by a generic rubric judge (`s15code.evals`) and never by a per-task answer key. Whether the cheapest rung shows the signature failure mode — lower cost per call, higher cost per resolved task — is reported as a finding, not asserted. |
 | `p2_budget_holds` | A run given a ceiling stays under it at every ceiling; a tight allowance downgrades the tier a node asked for; an unaffordable ceiling refuses instead of overspending; provider calls and ledger entries agree exactly. |
 | `p3_denial_of_wallet` | An adversarial planner that earns one more node from every outcome, forever, cannot spend past the ceiling. Refusals are visible graph failures. Reports the bill the same loop would have run up uncontrolled. |
 | `p4_trace_export` | The journal exports as `run → agent loop → plan → node → provider call`, with `gen_ai.usage.*` and cost on every provider-call span, summing exactly to the ledger. Content capture off. Works with no collector. |
