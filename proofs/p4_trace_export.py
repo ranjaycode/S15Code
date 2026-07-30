@@ -17,15 +17,37 @@ What is checked:
 4. Content capture is OFF: no prompt or completion text is anywhere in the trace.
 5. It works with no collector. Give ``--otel-endpoint`` and the same spans also go
    over the wire to Jaeger or any OTLP receiver.
+6. **The trace really landed.** Steps 1–5 all read the spans this process built,
+   which proves the exporter was *installed*, not that anything arrived. So when a
+   query API is reachable the proof reads the trace back *out of the backend* by id
+   and re-checks the hierarchy, the usage attributes and the absence of content on
+   the spans the backend actually stored. Nothing else in this repo can make the
+   claim "a real trace lands in Jaeger" true; a round trip can.
+
+   The query URL is ``S15_TRACE_QUERY_URL`` if set, and otherwise derived from the
+   OTLP endpoint's host on Jaeger's default UI port — so pointing the exporter at a
+   local Jaeger is enough, with no second flag to remember. When nothing is
+   reachable the round trip is reported as *not attempted* and the proof still
+   passes, because a collector is a deployment choice and not an invariant.
 
     python proofs/p4_trace_export.py --task "<anything>" --budget 0.02
     python proofs/p4_trace_export.py --task "<anything>" --budget 0.02 --offline
-    python proofs/p4_trace_export.py --task "<anything>" --otel-endpoint http://127.0.0.1:4318/v1/traces
+    #   with Jaeger up, the round trip happens automatically:
+    python proofs/p4_trace_export.py --task "<anything>" \
+        --otel-endpoint http://127.0.0.1:4318/v1/traces
+    #   ... or name a query API that is somewhere else:
+    S15_TRACE_QUERY_URL=http://jaeger.internal:16686 python proofs/p4_trace_export.py --task "<anything>"
 """
 
 from __future__ import annotations
 
+import json
+import os
+import re
 import tempfile
+import time
+import urllib.error
+import urllib.request
 from pathlib import Path
 
 from harness import Args, Proof, main, run_task, sync, transport_for
@@ -43,6 +65,82 @@ from s15code.telemetry.spans import (
 
 REQUIRED_GENAI = (GEN_AI_PROVIDER, GEN_AI_REQUEST_MODEL, GEN_AI_INPUT_TOKENS, GEN_AI_OUTPUT_TOKENS)
 EXPECTED_PARENT = {"agent_loop": "run", "plan": "agent_loop", "node": "agent_loop", "provider_call": "node"}
+
+#: Attribute-name fragments that would mean prompt or completion text escaped into
+#: the backend. Checked as substrings so a renamed convention cannot slip past.
+CONTENT_MARKERS = ("input.messages", "output.messages", "prompt", "completion")
+
+#: Jaeger's default UI/query port. Only used to guess a query URL from the OTLP
+#: endpoint's host when the operator did not name one.
+DEFAULT_QUERY_PORT = 16686
+
+
+# --- reading the trace back out of the backend ----------------------------- #
+
+
+def query_base(args: Args) -> str | None:
+    """Where to ask "did it arrive?". Explicit beats derived; derived beats nothing."""
+    explicit = (os.getenv("S15_TRACE_QUERY_URL") or "").strip()
+    if explicit:
+        return explicit.rstrip("/")
+    if not args.otel_endpoint:
+        return None
+    host = re.sub(r"^\w+://", "", args.otel_endpoint).split("/", 1)[0].rsplit(":", 1)[0]
+    return f"http://{host}:{DEFAULT_QUERY_PORT}" if host else None
+
+
+def fetch_trace(base: str, trace_id: str, *, attempts: int = 12, pause: float = 1.0) -> dict:
+    """Poll ``GET {base}/api/traces/{trace_id}`` until the backend has indexed it.
+
+    Ingestion is asynchronous, so a single immediate GET would be a flaky test of a
+    working system. Polling makes the check about arrival rather than about timing.
+    """
+    last = "no attempt made"
+    for _ in range(attempts):
+        try:
+            with urllib.request.urlopen(f"{base}/api/traces/{trace_id}", timeout=5) as resp:
+                payload = json.loads(resp.read().decode("utf-8"))
+            data = payload.get("data") or []
+            if data and data[0].get("spans"):
+                return {"ok": True, "trace": data[0], "query": f"{base}/api/traces/{trace_id}"}
+            last = "backend answered with no spans for that id"
+        except urllib.error.URLError as e:
+            last = f"{type(e).__name__}: {e}"
+        except Exception as e:  # pragma: no cover - any backend hiccup is just "not yet"
+            last = f"{type(e).__name__}: {e}"
+        time.sleep(pause)
+    return {"ok": False, "reason": last, "query": f"{base}/api/traces/{trace_id}"}
+
+
+def backend_hierarchy(trace: dict) -> tuple[dict[str, int], list, list]:
+    """Read kinds, parent-kind pairs and content leaks from the *backend's* copy."""
+    spans = trace.get("spans") or []
+    tags = {s["spanID"]: {t["key"]: t.get("value") for t in (s.get("tags") or [])} for s in spans}
+
+    def parent_of(span):
+        for ref in span.get("references") or []:
+            if ref.get("refType") == "CHILD_OF":
+                return ref.get("spanID")
+        return None
+
+    counts: dict[str, int] = {}
+    for span_id, attrs in tags.items():
+        kind = str(attrs.get("s15.span.kind", "unknown"))
+        counts[kind] = counts.get(kind, 0) + 1
+    wrong = []
+    for span in spans:
+        kind = str(tags[span["spanID"]].get("s15.span.kind", ""))
+        expected = EXPECTED_PARENT.get(kind)
+        if expected is None:
+            continue
+        parent = parent_of(span)
+        got = str(tags.get(parent, {}).get("s15.span.kind")) if parent else None
+        if got != expected:
+            wrong.append((span["operationName"], kind, got))
+    leaks = sorted(
+        {key for attrs in tags.values() for key in attrs if any(m in key for m in CONTENT_MARKERS)}
+    )
+    return counts, wrong, leaks
 
 
 def run(args: Args) -> Proof:
@@ -128,6 +226,52 @@ def run(args: Args) -> Proof:
     proof.check("no collector is required" if not args.otel_endpoint else "spans were exported over the wire",
                 export.exported_over_the_wire == bool(args.otel_endpoint),
                 f"exported_over_the_wire={export.exported_over_the_wire}")
+
+    # 6. the round trip: is it actually in the backend?
+    base = query_base(args)
+    trace_id = totals["trace_ids"][0] if totals["trace_ids"] else None
+    proof.fact("trace query url", base or "(none: no backend to ask)")
+    if not (base and trace_id and export.exported_over_the_wire):
+        # Not a failure. Building the spans is the invariant; shipping them to a
+        # particular backend is a deployment, and the proof must run in CI with none.
+        proof.fact("backend round trip", "not attempted")
+        proof.check("a real trace lands in the backend (skipped: none configured)", True,
+                    f"otel_endpoint={args.otel_endpoint or None}, query={base or None}")
+    else:
+        found = fetch_trace(base, trace_id)
+        proof.fact("backend query", found["query"])
+        proof.check("a real trace lands in the backend, fetched back by id", found["ok"],
+                    found.get("reason") or f"{len(found['trace']['spans'])} spans returned")
+        if found["ok"]:
+            trace = found["trace"]
+            counts, wrong, leaks = backend_hierarchy(trace)
+            services = sorted({p.get("serviceName") for p in (trace.get("processes") or {}).values()})
+            proof.fact("backend spans", len(trace["spans"]))
+            proof.fact("backend span kinds", counts)
+            proof.fact("backend service", services)
+            proof.check("the backend holds every span this process emitted",
+                        len(trace["spans"]) == totals["spans"],
+                        f"{len(trace['spans'])} in backend == {totals['spans']} emitted")
+            proof.check("the hierarchy survives the wire (parents read from the backend)",
+                        not wrong and {"run", "agent_loop", "plan", "node", "provider_call"} <= set(counts),
+                        wrong or sorted(counts))
+            backend_calls = [
+                {t["key"]: t.get("value") for t in (s.get("tags") or [])}
+                for s in trace["spans"]
+                if any(t.get("key") == "s15.span.kind" and t.get("value") == "provider_call"
+                       for t in (s.get("tags") or []))
+            ]
+            missing_backend = [
+                [name for name in REQUIRED_GENAI if name not in attrs] for attrs in backend_calls
+            ]
+            proof.check("gen_ai.usage.* and cost are visible on the backend's spans",
+                        bool(backend_calls) and not any(missing_backend)
+                        and all(float(a.get(COST, 0) or 0) > 0 for a in backend_calls),
+                        [{k: a.get(k) for k in (*REQUIRED_GENAI, COST)} for a in backend_calls]
+                        or "no provider-call span in the backend")
+            proof.check("no prompt or completion text reached the backend", not leaks,
+                        leaks or f"none of {list(CONTENT_MARKERS)} appears in any backend tag")
+            proof.record("backend_trace", trace)
 
     proof.record("budget", budget)
     proof.record("totals", totals)
