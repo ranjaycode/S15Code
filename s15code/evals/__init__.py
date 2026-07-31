@@ -30,6 +30,18 @@ from .judge import (
     Verdict,
     parse_scores,
 )
+from .pairs import (
+    POSITIVE_LABEL,
+    LabelledPair,
+    Operating,
+    best_operating,
+    by_family,
+    load_pairs,
+    separable,
+    steepest_fpr_drop,
+    sweep,
+    thresholds,
+)
 from .tasks import EvalTask, load_tasks
 
 __all__ = [
@@ -41,10 +53,20 @@ __all__ = [
     "JudgeModel",
     "JudgeSample",
     "JudgeUnparseable",
+    "LabelledPair",
+    "Operating",
+    "POSITIVE_LABEL",
     "RubricConfig",
     "RubricJudge",
     "StrategyPolicy",
     "Verdict",
+    "best_operating",
+    "by_family",
+    "load_pairs",
     "load_tasks",
     "parse_scores",
+    "separable",
+    "steepest_fpr_drop",
+    "sweep",
+    "thresholds",
 ]

@@ -120,15 +120,17 @@ the layer is additive.
 
 ## Proofs
 
-One harness, one code path, four proofs. Each takes the **task (or task set),
-budget and principal as arguments**, asserts real invariants, exits non-zero on
-failure, and writes JSON to `proofs/out/`.
+One harness, one code path, six proofs. Each takes the **task (or task set, or
+pair set), budget and principal as arguments**, asserts real invariants, exits
+non-zero on failure, and writes JSON to `proofs/out/`.
 
 ```bash
-uv run python proofs/p1_cost_per_task.py   --tasks proofs/tasks/mixed.jsonl
-uv run python proofs/p2_budget_holds.py    --task "<any task>" --budget 0.02
+uv run python proofs/p1_cost_per_task.py    --tasks proofs/tasks/mixed.jsonl
+uv run python proofs/p2_budget_holds.py     --task "<any task>" --budget 0.02
 uv run python proofs/p3_denial_of_wallet.py --task "<any task>" --budget 0.002
 uv run python proofs/p4_trace_export.py     --task "<any task>" --budget 0.02
+uv run python proofs/p6_cache_savings.py    --pairs proofs/pairs/paraphrases.jsonl
+uv run python proofs/p7_cross_model_ladder.py --task "<any task>"
 ```
 
 | Proof | Proves |
@@ -137,6 +139,8 @@ uv run python proofs/p4_trace_export.py     --task "<any task>" --budget 0.02
 | `p2_budget_holds` | A run given a ceiling stays under it at every ceiling; a tight allowance downgrades the tier a node asked for; an unaffordable ceiling refuses instead of overspending; provider calls and ledger entries agree exactly. |
 | `p3_denial_of_wallet` | An adversarial planner that earns one more node from every outcome, forever, cannot spend past the ceiling. Refusals are visible graph failures. Reports the bill the same loop would have run up uncontrolled. |
 | `p4_trace_export` | The journal exports as `run → agent loop → plan → node → provider call`, with `gen_ai.usage.*` and cost on every provider-call span, summing exactly to the ledger. Content capture off. Works with no collector. |
+| `p6_cache_savings` | The gateway's semantic cache, against the **real** embedder. A 768-dim nomic vector is confirmed to be neither a stub nor a constant; the similarity the gateway acts on is checked against a cosine computed independently; a hit is billed $0 and its saving is read off the cold call it replaced. Then the threshold is **swept** over a labelled pair set (`proofs/pairs/`), reporting true- and false-positive rates per threshold and per negative family. Whether a collision-free threshold exists is a finding, not an assertion — and on the shipped set it does not. |
+| `p7_cross_model_ladder` | Every rung is a different model on a different provider; budget pressure walks the whole ladder down, one model at a time; projected cost is monotone; the measured top-to-bottom spread is reported as a multiple. |
 
 **Two modes, one code path.** If the gateway at `--base-url` answers, the proofs
 make real calls and meter real money. Otherwise (or with `--offline`) a
